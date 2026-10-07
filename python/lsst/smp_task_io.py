@@ -21,7 +21,7 @@ from lsst.afw.detection import InvalidPsfError
 
 
 
-class CreateConnections(PipelineTaskConnections,
+class SMPTaskConnections(PipelineTaskConnections,
                         dimensions=("instrument", "visit", "detector")):
     
     visitImage = connTypes.Input(
@@ -29,7 +29,7 @@ class CreateConnections(PipelineTaskConnections,
         name="visit_image",
         dimensions=("instrument","visit","detector"),
         storageClass="ExposureF",
-        multiple_inputs=True,
+        multiple=True,
     )
     
     visitSummary = connTypes.Input(
@@ -58,9 +58,9 @@ def _validate_ra(item):
     return (item > 0) and (item < 360)
 
 
-class CreateConfig(
+class SMPTaskConfig(
         PipelineTaskConfig,
-        pipelineConnections=CreateConnections):
+        pipelineConnections=SMPTaskConnections):
     """Configuration for CreateTask, prepares scene modeling inputs.
     """
 
@@ -97,12 +97,12 @@ class CreateConfig(
     )
 
 
-class CreateTask(PipelineTask):
+class SMPTask(PipelineTask):
     """Prepare inputs for scene modeling photometry of SNIa candidates.
     """
 
     _DefaultName = "createSceneModelingInputs"
-    ConfigClass = CreateConfig
+    ConfigClass = SMPTaskConfig
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)   # initialise the mother class PipelineTask
@@ -114,7 +114,7 @@ class CreateTask(PipelineTask):
         outputs = self.run(**inputs)
         butlerQC.put(outputs, outputRefs)
 
-    def run(self, visitImage, visitSummary=None):
+    def run(self, visitImage_refs, visitSummary=None):
         """
         """
         
@@ -129,59 +129,69 @@ class CreateTask(PipelineTask):
             "blablabla"
         """
 
-        wcs = visitImage.getWcs()
-        #psf = visitImage.getPsf()
-        #photoCalib = visitImage.getPhotoCalib()
-        #bbox = visitImage.getBBox()
-        visitInfo = visitImage.getInfo().getVisitInfo()
-        mjd = visitInfo.getDate().get()  # MJD as float
-
-        # Determine ON/OFF for this visit
-        # ON = SN is present
-        # OFF = no SN expected
-        on_flag = self._compute_on_off(mjd)
-
         cutouts = []
         positions = []
         on_off_flags = []
         #psfs = []
         #wcss = []
         #phot_ratios = []
-
-        for ra, dec in zip(self.config.ra, self.config.dec):
-            sky_coord = geom.SpherePoint(ra, dec, geom.degrees)  # convert SN candidate coords in lsst.geom object
-            pixel_coord = wcs.skyToPixel(sky_coord)
-            pixel_point = geom.Point2I(pixel_coord)
-
-            # 1- Data cutout
-            cutout = self._extract_cutout(visitImage, sky_coord)
-            if cutout is None:
-                self.log.warning(
-                    f"Could not extract cutout for SN at (ra={ra}, dec={dec}).")
-                continue
+        
+        for visit_ref in visitImage_refs:
+            visitImage = visit_ref.get()
+            wcs = visitImage.getWcs()
+            #psf = visitImage.getPsf()
+            #photoCalib = visitImage.getPhotoCalib()
+            bbox = visitImage.getBBox()
+            visitInfo = visitImage.getInfo().getVisitInfo()
+            mjd = visitInfo.getDate().get()  # MJD as float
+    
+            # Determine ON/OFF for this visit
+            # ON = SN is present
+            # OFF = no SN expected
+            on_flag = self._compute_on_off(mjd)
+    
+            for ra, dec in zip(self.config.ra, self.config.dec):
+                sky_coord = geom.SpherePoint(ra, dec, geom.degrees)  # convert SN candidate coords in lsst.geom object
+                pixel_coord = wcs.skyToPixel(sky_coord)
+                pixel_point = geom.Point2I(pixel_coord)
                 
-            ccdData, raw_array = cutout
-
-            # 2- PSF at SN position
-            cutout_psf = self._compute_psf(visitImage, pixel_point)  # now done in _extract_cutout
-            ccdData.psf = cutout_psf
-
-            # 3- PSF derivative
-
-            # 4- WCS
-
-            # 5- Photometric ratio (Ri)
-            #phot_ratio = self._compute_phot_ratio(photoCalib, pixel_coord)
-            
-
-            # Append results
-            cutouts.append(ccdData)
-            positions.append((ra, dec))
-            on_off_flags.append(on_flag)
-            #psfs.append(cutout_psf)
-            #wcss.append(sn_wcs)
-            #phot_ratios.append(phot_ratio)
-            
+                if visitImage.containsSkyCoords(ra*u.degree, dec*u.degree) == False :
+                    continue
+    
+                # 1- Data cutout
+                cutout = self._extract_cutout(visitImage, sky_coord)
+                if cutout is None:
+                    self.log.warning(
+                        f"Could not extract cutout for SN at (ra={ra}, dec={dec}).")
+                    continue
+                    
+                ccdData, raw_array = cutout
+    
+                # 2- PSF at SN position
+                cutout_psf = self._compute_psf(visitImage, pixel_coord)  # now done in _extract_cutout
+                ccdData.psf = cutout_psf
+    
+                # 3- PSF derivative
+    
+                # 4- WCS
+    
+                # 5- Photometric ratio (Ri)
+                #phot_ratio = self._compute_phot_ratio(photoCalib, pixel_coord)
+                
+    
+                # Append results
+                cutouts.append(ccdData)
+                positions.append((ra, dec))
+                on_off_flags.append(on_flag)
+                #psfs.append(cutout_psf)
+                #wcss.append(sn_wcs)
+                #phot_ratios.append(phot_ratio)
+    
+        result_dict = {
+            "cutouts": cutouts,
+            "positions": positions,
+            "on_off": on_off_flags,
+        }
 
         return Struct(sceneModelingInputs=result_dict)
 
@@ -202,8 +212,11 @@ class CreateTask(PipelineTask):
     def _extract_cutout(self, visitImage, sky_coord):
         """Extract a square cutout array centered on sky_coord (SpherePoint object)
         """
+        print(sky_coord)
         visit_wcs = visitImage.getWcs()
+        print(visit_wcs)
         pixel_point = visit_wcs.skyToPixel(sky_coord)
+        print(pixel_point)
         
         x_center = int(round(pixel_point.x))
         y_center = int(round(pixel_point.y))
@@ -238,17 +251,18 @@ class CreateTask(PipelineTask):
                                sky_coord.getDec().asDegrees()]
         cutoutWcs.wcs.cd = self._make_local_transform_matrix(visit_wcs, pixel_point, sky_coord)
 
-        cutout2D = np.array([calibCutout.getImage().array, cutout_exposure.getImage().array])
+        #cutout2D = np.array([calibCutout.getImage().array, cutout_exposure.getImage().array])
 
         # Build a CCDData object with everything
         ccdData = CCDData(
-            data=cutout2D,
+            data=calibCutout.getImage().array,
             uncertainty=VarianceUncertainty(calibCutout.getVariance().array),
             flags=calibCutout.getMask().array,
             wcs=cutoutWcs,
             meta={"cutMinX": cutOutMinX,
                   "cutMinY": cutOutMinY},
             unit=u.nJy)
+        #print(ccdData)
 
         return ccdData, cutout_exposure.getImage().array.copy()
 
@@ -339,4 +353,5 @@ class CreateTask(PipelineTask):
 
     
     #def _compute_phot_ratio(self, photoCalib, pixel_coord):
+    #    phot_ratio = photoCalib.instFluxToNanojansky(1.0, pixel_coord)
     #    return
