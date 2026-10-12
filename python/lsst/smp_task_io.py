@@ -39,14 +39,13 @@ class SMPTaskConnections(PipelineTaskConnections,
         storageClass="ExposureCatalog",
     )
 
-    ########
     scene_modeling_inputs = connTypes.Output(
         doc="Inputs prepared for scene modeling photometry.",
         name="sceneModelingInputs",
         dimensions=("instrument","visit","detector"),
         storageClass="ArrowAstropy",
     )
-    ########
+
 
 
 def _validate_dec(item):
@@ -56,6 +55,7 @@ def _validate_dec(item):
 def _validate_ra(item):
     "Ensure a valid right ascention value."
     return (item > 0) and (item < 360)
+
 
 
 class SMPTaskConfig(
@@ -115,39 +115,49 @@ class SMPTask(PipelineTask):
         butlerQC.put(outputs, outputRefs)
 
     def run(self, visitImage_refs, visitSummary=None):
-        """
-        """
-        
-        """
-        repo = "dp2_prep"
-        collection_stage4 = "LSSTCam/runs/DRP/DP2/v30_0_6/DM-53881/stage4"
-        butler_stage4 =  Butler(repo, collections=collection_stage4)
+        """Execute the pipeline task to prepare inputs for scene modeling photometry.
 
-        try:
-            visitImage = butler_stage4.get('visit_image', visit=visit, detector=det)
-        except Exception as e:
-            "blablabla"
+        Iterates over input visit exposure references, checks sky coverage for each SN 
+        candidate, extracts image cutouts centered on the source, computes the 
+        local PSF, retrieves photometric calibration ratios, and evaluates the 
+        ON/OFF state based on observation epochs (MJD).
+
+        Parameters
+        ----------
+        visitImage_refs : 'list' of 'lsst.daf.butler._deferredDatasetHandle.DeferredDatasetHandle'
+            References to the calibrated visit images ('visit_image') to process.
+        visitSummary : 'lsst.afw.table.ExposureCatalog', optional
+            Summary catalog containing information about the visits.
+
+        Returns
+        -------
+        'lsst.pipe.base.Struct'
+            A structure containing a dictionary under the key 'sceneModelingInputs' with:
+            - 'cutouts': 'list' of 'astropy.nddata.CCDData' objects containing image cutouts, WCS, variances and masks.
+            - 'positions': 'list' of 'tuple' (ra, dec) coordinates for each processed target.
+            - 'on_off': 'list' of 'bool' flags indicating if the SN is expected to be present (ON) or absent (OFF).
+            - 'photometric_ratios': 'list' of 'float' local calibration factors.
         """
 
         cutouts = []
         positions = []
         on_off_flags = []
-        #psfs = []
-        #wcss = []
-        #phot_ratios = []
+        phot_ratios = []
         
         for visit_ref in visitImage_refs:
             visitImage = visit_ref.get()
             wcs = visitImage.getWcs()
             #psf = visitImage.getPsf()
-            #photoCalib = visitImage.getPhotoCalib()
+            photoCalib = visitImage.getPhotoCalib()
             bbox = visitImage.getBBox()
             visitInfo = visitImage.getInfo().getVisitInfo()
             mjd = visitInfo.getDate().get()  # MJD as float
+
+            #print(photoCalib)
+            #print(f"calibrationMean = {photoCalib.getCalibrationMean()}")
+            #print(f"calibrationErr  = {photoCalib.getCalibrationErr()}")
     
             # Determine ON/OFF for this visit
-            # ON = SN is present
-            # OFF = no SN expected
             on_flag = self._compute_on_off(mjd)
     
             for ra, dec in zip(self.config.ra, self.config.dec):
@@ -164,7 +174,6 @@ class SMPTask(PipelineTask):
                     self.log.warning(
                         f"Could not extract cutout for SN at (ra={ra}, dec={dec}).")
                     continue
-                    
                 ccdData, raw_array = cutout
     
                 # 2- PSF at SN position
@@ -173,30 +182,28 @@ class SMPTask(PipelineTask):
     
                 # 3- PSF derivative
     
-                # 4- WCS
-    
-                # 5- Photometric ratio (Ri)
-                #phot_ratio = self._compute_phot_ratio(photoCalib, pixel_coord)
+                # 4- Photometric ratio (Ri)
+                phot_ratio = self._compute_phot_ratio(photoCalib, pixel_coord)
                 
-    
                 # Append results
                 cutouts.append(ccdData)
                 positions.append((ra, dec))
                 on_off_flags.append(on_flag)
                 #psfs.append(cutout_psf)
-                #wcss.append(sn_wcs)
-                #phot_ratios.append(phot_ratio)
+                phot_ratios.append(phot_ratio)
     
         result_dict = {
             "cutouts": cutouts,
             "positions": positions,
             "on_off": on_off_flags,
+            "photometric_ratios": phot_ratios
         }
 
         return Struct(sceneModelingInputs=result_dict)
 
+    
 
-    # Private methods
+    ########### Private methods ####################################################################
 
     def _compute_on_off(self, mjd):
         """ Return True if the SN is expected to be present at this MJD.
@@ -210,13 +217,33 @@ class SMPTask(PipelineTask):
 
     
     def _extract_cutout(self, visitImage, sky_coord):
-        """Extract a square cutout array centered on sky_coord (SpherePoint object)
+        """Extract a square cutout array centered on the given sky_coord (SpherePoint object).
+
+        Projects the target sky coordinates to pixel coordinates on the provided 
+        visit image, defines a square bounding box using the configured half-size, 
+        and extracts the corresponding cutout exposure. It applies photometric 
+        calibration, builds a local Astropy WCS approximation, and wraps the 
+        resulting data into an Astropy CCDData object.
+
+        Parameters
+        ----------
+        visitImage : 'lsst.afw.image.Exposure'
+            The calibrated visit image exposure from which to extract the cutout.
+        sky_coord : 'lsst.geom.SpherePoint'
+            The (RA, Dec) coordinates representing the center of the cutout.
+
+        Returns
+        -------
+        'tuple' of ('astropy.nddata.CCDData', 'numpy.ndarray') or 'None'
+            A tuple containing:
+            - `ccdData`: The calibrated cutout wrapped as an Astropy CCDData object 
+              (including data array, variance uncertainty, mask, local WCS, and metadata).
+            - `raw_array`: A copy of the uncalibrated image data array.
+            Returns `None` if the calculated cutout box extends outside the valid 
+            bounding box of the visit image.
         """
-        print(sky_coord)
         visit_wcs = visitImage.getWcs()
-        print(visit_wcs)
         pixel_point = visit_wcs.skyToPixel(sky_coord)
-        print(pixel_point)
         
         x_center = int(round(pixel_point.x))
         y_center = int(round(pixel_point.y))
@@ -262,7 +289,6 @@ class SMPTask(PipelineTask):
             meta={"cutMinX": cutOutMinX,
                   "cutMinY": cutOutMinY},
             unit=u.nJy)
-        #print(ccdData)
 
         return ccdData, cutout_exposure.getImage().array.copy()
 
@@ -352,6 +378,24 @@ class SMPTask(PipelineTask):
     #    return
 
     
-    #def _compute_phot_ratio(self, photoCalib, pixel_coord):
-    #    phot_ratio = photoCalib.instFluxToNanojansky(1.0, pixel_coord)
-    #    return
+    def _compute_phot_ratio(self, photoCalib, pixel_coord):
+        """Return the local photometric calibration factor R_i [nJy / electron] defined as :
+            F_physical = R_i * f_instrumental
+        
+        Parameters
+        ----------
+        photoCalib : `lsst.afw.image.PhotoCalib`
+            Photometric calibration object attached to the visit image.
+        pixel_coord : `lsst.geom.Point2D`
+            Pixel coordinates of the SN on this detector.
+
+        Returns
+        -------
+        phot_ratio : `float`
+            Local calibration factor in nJy/electron
+            (Note: if the mean equals 1.0 with an error of about 5e-4, it means the visitImage
+            has already been pre-normalized during dataset preparation, meaning that upstream
+            processing has already converted raw instrumental counts into physical units (nJy)
+            directly within the pixels, so the calibration factor acts as a neutral identity).
+        """
+        return float(photoCalib.getLocalCalibration(pixel_coord))
